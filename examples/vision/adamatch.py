@@ -2,9 +2,10 @@
 Title: Semi-supervision and domain adaptation with AdaMatch
 Author: [Sayak Paul](https://twitter.com/RisingSayak)
 Date created: 2021/06/19
-Last modified: 2021/06/19
+Last modified: 2026/03/09
 Description: Unifying semi-supervised learning and unsupervised domain adaptation with AdaMatch.
 Accelerator: GPU
+Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
 """
 
 """
@@ -20,10 +21,6 @@ adaptation (SSDA).
 
 This example requires TensorFlow 2.5 or higher, as well as TensorFlow Models, which can
 be installed using the following command:
-"""
-
-"""shell
-pip install -q tf-models-official==2.9.2
 """
 
 """
@@ -62,42 +59,47 @@ Popular domain adaptation algorithms in deep learning include
 ## Setup
 """
 
-import tensorflow as tf
+import os
 
-tf.random.set_seed(42)
+os.environ["KERAS_BACKEND"] = "tensorflow"
+
+import keras
+
+keras.utils.set_random_seed(42)
 
 import numpy as np
-
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras import regularizers
-from keras_cv.layers import RandAugment
-
-import tensorflow_datasets as tfds
-
-tfds.disable_progress_bar()
+from keras import layers, ops
+import scipy.io
 
 """
 ## Prepare the data
 """
 
 # MNIST
-(
-    (mnist_x_train, mnist_y_train),
-    (mnist_x_test, mnist_y_test),
-) = keras.datasets.mnist.load_data()
+(mnist_x_train, mnist_y_train), (mnist_x_test, mnist_y_test) = (
+    keras.datasets.mnist.load_data()
+)
 
 # Add a channel dimension
-mnist_x_train = tf.expand_dims(mnist_x_train, -1)
-mnist_x_test = tf.expand_dims(mnist_x_test, -1)
+mnist_x_train = np.expand_dims(mnist_x_train, -1)
+mnist_x_test = np.expand_dims(mnist_x_test, -1)
 
 # Convert the labels to one-hot encoded vectors
-mnist_y_train = tf.one_hot(mnist_y_train, 10).numpy()
+mnist_y_train = keras.utils.to_categorical(mnist_y_train, 10)
+
 
 # SVHN
-svhn_train, svhn_test = tfds.load(
-    "svhn_cropped", split=["train", "test"], as_supervised=True
-)
+def load_svhn_data():
+    path = keras.utils.get_file(
+        "train_32x32.mat",
+        "http://ufldl.stanford.edu/housenumbers/train_32x32.mat",
+    )
+    data = scipy.io.loadmat(path)
+    x = np.transpose(data["X"], (3, 0, 1, 2))
+    return x
+
+
+svhn_x_train = load_svhn_data()
 
 """
 ## Define constants and hyperparameters
@@ -107,11 +109,10 @@ RESIZE_TO = 32
 
 SOURCE_BATCH_SIZE = 64
 TARGET_BATCH_SIZE = 3 * SOURCE_BATCH_SIZE  # Reference: Section 3.2
-EPOCHS = 10
+EPOCHS = 5
 STEPS_PER_EPOCH = len(mnist_x_train) // SOURCE_BATCH_SIZE
 TOTAL_STEPS = EPOCHS * STEPS_PER_EPOCH
 
-AUTO = tf.data.AUTOTUNE
 LEARNING_RATE = 0.03
 
 WEIGHT_DECAY = 0.0005
@@ -120,114 +121,36 @@ DEPTH = 28
 WIDTH_MULT = 2
 
 """
-## Data augmentation utilities
-
-A standard element of SSL algorithms is to feed weakly and strongly augmented versions of
-the same images to the learning model to make its predictions consistent. For strong
-augmentation, [RandAugment](https://arxiv.org/abs/1909.13719) is a standard choice. For
-weak augmentation, we will use horizontal flipping and random cropping.
-"""
-
-# Initialize `RandAugment` object with 2 layers of
-# augmentation transforms and strength of 5.
-augmenter = RandAugment(value_range=(0, 255), augmentations_per_image=2, magnitude=0.5)
-
-
-def weak_augment(image, source=True):
-    if image.dtype != tf.float32:
-        image = tf.cast(image, tf.float32)
-
-    # MNIST images are grayscale, this is why we first convert them to
-    # RGB images.
-    if source:
-        image = tf.image.resize_with_pad(image, RESIZE_TO, RESIZE_TO)
-        image = tf.tile(image, [1, 1, 3])
-    image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_crop(image, (RESIZE_TO, RESIZE_TO, 3))
-    return image
-
-
-def strong_augment(image, source=True):
-    if image.dtype != tf.float32:
-        image = tf.cast(image, tf.float32)
-
-    if source:
-        image = tf.image.resize_with_pad(image, RESIZE_TO, RESIZE_TO)
-        image = tf.tile(image, [1, 1, 3])
-    image = augmenter(image)
-    return image
-
-
-"""
 ## Data loading utilities
 """
 
 
-def create_individual_ds(ds, aug_func, source=True):
-    if source:
-        batch_size = SOURCE_BATCH_SIZE
-    else:
-        # During training 3x more target unlabeled samples are shown
-        # to the model in AdaMatch (Section 3.2 of the paper).
-        batch_size = TARGET_BATCH_SIZE
-    ds = ds.shuffle(batch_size * 10, seed=42)
+class AdaMatchDataset(keras.utils.PyDataset):
+    def __init__(self, source_x, source_y, target_x, **kwargs):
+        super().__init__(**kwargs)
+        self.source_x = source_x
+        self.source_y = source_y
+        self.target_x = target_x
+        self.resizer = layers.Resizing(RESIZE_TO, RESIZE_TO)
 
-    if source:
-        ds = ds.map(lambda x, y: (aug_func(x), y), num_parallel_calls=AUTO)
-    else:
-        ds = ds.map(lambda x, y: (aug_func(x, False), y), num_parallel_calls=AUTO)
+    def __len__(self):
+        return STEPS_PER_EPOCH
 
-    ds = ds.batch(batch_size).prefetch(AUTO)
-    return ds
+    def __getitem__(self, idx):
+        s_idx = np.random.choice(len(self.source_x), SOURCE_BATCH_SIZE)
+        t_idx = np.random.choice(len(self.target_x), TARGET_BATCH_SIZE)
 
+        s_imgs = self.resizer(self.source_x[s_idx].astype("float32"))
+        s_imgs = ops.tile(s_imgs, (1, 1, 1, 3))
 
-"""
-`_w` and `_s` suffixes denote weak and strong respectively.
-"""
+        t_imgs = self.target_x[t_idx].astype("float32")
 
-source_ds = tf.data.Dataset.from_tensor_slices((mnist_x_train, mnist_y_train))
-source_ds_w = create_individual_ds(source_ds, weak_augment)
-source_ds_s = create_individual_ds(source_ds, strong_augment)
-final_source_ds = tf.data.Dataset.zip((source_ds_w, source_ds_s))
-
-target_ds_w = create_individual_ds(svhn_train, weak_augment, source=False)
-target_ds_s = create_individual_ds(svhn_train, strong_augment, source=False)
-final_target_ds = tf.data.Dataset.zip((target_ds_w, target_ds_s))
-
-"""
-Here's what a single image batch looks like:
-
-![](https://i.imgur.com/aver8cG.png)
-"""
-
-"""
-## Loss computation utilities
-"""
+        return (s_imgs, self.source_y[s_idx].astype("float32"), t_imgs), np.zeros(
+            (SOURCE_BATCH_SIZE,)
+        )
 
 
-def compute_loss_source(source_labels, logits_source_w, logits_source_s):
-    loss_func = keras.losses.CategoricalCrossentropy(from_logits=True)
-    # First compute the losses between original source labels and
-    # predictions made on the weakly and strongly augmented versions
-    # of the same images.
-    w_loss = loss_func(source_labels, logits_source_w)
-    s_loss = loss_func(source_labels, logits_source_s)
-    return w_loss + s_loss
-
-
-def compute_loss_target(target_pseudo_labels_w, logits_target_s, mask):
-    loss_func = keras.losses.CategoricalCrossentropy(from_logits=True, reduction="none")
-    target_pseudo_labels_w = tf.stop_gradient(target_pseudo_labels_w)
-    # For calculating loss for the target samples, we treat the pseudo labels
-    # as the ground-truth. These are not considered during backpropagation
-    # which is a standard SSL practice.
-    target_loss = loss_func(target_pseudo_labels_w, logits_target_s)
-
-    # More on `mask` later.
-    mask = tf.cast(mask, target_loss.dtype)
-    target_loss *= mask
-    return tf.reduce_mean(target_loss, 0)
-
+train_ds = AdaMatchDataset(mnist_x_train, mnist_y_train, svhn_x_train)
 
 """
 ## Subclassed model for AdaMatch training
@@ -256,101 +179,130 @@ we will discuss shortly).
 6. We compute the loss and update the gradients of the underlying model.
 """
 
+"""
+## Data augmentation utilities
+
+A standard element of SSL algorithms is to feed weakly and strongly augmented versions of
+the same images to the learning model to make its predictions consistent. For strong
+augmentation, [RandAugment](https://arxiv.org/abs/1909.13719) is a standard choice. For
+weak augmentation, we will use horizontal flipping and random cropping.
+"""
+
 
 class AdaMatch(keras.Model):
     def __init__(self, model, total_steps, tau=0.9):
         super().__init__()
         self.model = model
-        self.tau = tau  # Denotes the confidence threshold
-        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
+        self.tau = tau
         self.total_steps = total_steps
-        self.current_step = tf.Variable(0, dtype="int64")
+        self.current_step = keras.Variable(0.0, dtype="float32")
 
-    @property
-    def metrics(self):
-        return [self.loss_tracker]
+        self.weak_augment = keras.Sequential(
+            [
+                layers.RandomFlip("horizontal"),
+                layers.RandomTranslation(0.1, 0.1, fill_mode="constant"),
+            ]
+        )
+
+        rand_aug = layers.RandAugment(value_range=(0, 255), num_ops=2, factor=0.5)
+        self.strong_aug = rand_aug
 
     # This is a warmup schedule to update the weight of the
     # loss contributed by the target unlabeled samples. More
     # on this in the text.
     def compute_mu(self):
-        pi = tf.constant(np.pi, dtype="float32")
-        step = tf.cast(self.current_step, dtype="float32")
-        return 0.5 - tf.cos(tf.math.minimum(pi, (2 * pi * step) / self.total_steps)) / 2
+        pi = ops.cast(np.pi, "float32")
+        return (
+            0.5
+            - ops.cos(ops.minimum(pi, (2 * pi * self.current_step) / self.total_steps))
+            / 2
+        )
 
-    def train_step(self, data):
-        ## Unpack and organize the data ##
-        source_ds, target_ds = data
-        (source_w, source_labels), (source_s, _) = source_ds
-        (
-            (target_w, _),
-            (target_s, _),
-        ) = target_ds  # Notice that we are NOT using any labels here.
+    def call(self, inputs, training=False):
+        source_imgs, _, _ = inputs
+        return self.model(source_imgs, training=training)
 
-        combined_images = tf.concat([source_w, source_s, target_w, target_s], 0)
-        combined_source = tf.concat([source_w, source_s], 0)
+    def compute_loss(self, x=None, y_true=None, y_pred=None, sample_weight=None):
+        source_imgs, source_labels, target_imgs = x
 
-        total_source = tf.shape(combined_source)[0]
-        total_target = tf.shape(tf.concat([target_w, target_s], 0))[0]
+        source_ds_w = self.weak_augment(source_imgs, training=True)
+        source_ds_s = self.strong_aug(source_imgs, training=True)
 
-        with tf.GradientTape() as tape:
-            ## Forward passes ##
-            combined_logits = self.model(combined_images, training=True)
-            z_d_prime_source = self.model(
-                combined_source, training=False
-            )  # No BatchNorm update.
-            z_prime_source = combined_logits[:total_source]
+        target_ds_w = self.weak_augment(target_imgs, training=True)
+        target_ds_s = self.strong_aug(target_imgs, training=True)
 
-            ## 1. Random logit interpolation for the source images ##
-            lambd = tf.random.uniform((total_source, 10), 0, 1)
-            final_source_logits = (lambd * z_prime_source) + (
-                (1 - lambd) * z_d_prime_source
+        combined_images = ops.concatenate(
+            [source_ds_w, source_ds_s, target_ds_w, target_ds_s], axis=0
+        )
+
+        combined_source = ops.concatenate([source_ds_w, source_ds_s], axis=0)
+        ## Forward passes ##
+        combined_logits = self.model(combined_images, training=True)
+        z_d_prime_source = self.model(
+            combined_source, training=False
+        )  # No BatchNorm update.
+
+        total_source = ops.shape(combined_source)[0]
+        z_prime_source = combined_logits[:total_source]
+
+        ## 1. Random logit interpolation for the source images ##
+        lambd = keras.random.uniform(ops.shape(z_prime_source), 0, 1)
+
+        final_source_logits = (lambd * z_prime_source) + (
+            (1 - lambd) * z_d_prime_source
+        )
+
+        ## 2. Distribution alignment (only consider weakly augmented images) ##
+        # Compute softmax for logits of the WEAKLY augmented SOURCE images.
+        y_hat_source_w = ops.softmax(final_source_logits[:SOURCE_BATCH_SIZE])
+
+        # Extract logits for the WEAKLY augmented TARGET images and compute softmax.
+        logits_target = combined_logits[total_source:]
+        logits_target_w = logits_target[:TARGET_BATCH_SIZE]
+        y_hat_target_w = ops.softmax(logits_target_w)
+
+        source_dist = ops.mean(y_hat_source_w, axis=0) + 1e-8
+        target_dist = ops.mean(y_hat_target_w, axis=0) + 1e-8
+
+        # Align the target label distribution to that of the source.
+        expectation_ratio = source_dist / target_dist
+        expectation_ratio = ops.clip(expectation_ratio, 0.1, 10.0)
+        y_tilde_target_w = ops.stop_gradient(
+            ops.normalize(y_hat_target_w * expectation_ratio, axis=-1, order=1)
+        )
+
+        ## 3. Relative confidence thresholding ##
+        row_wise_max = ops.max(y_hat_source_w, axis=-1)
+        c_tau = self.tau * ops.mean(row_wise_max)
+        mask = ops.cast(ops.max(y_tilde_target_w, axis=-1) >= c_tau, "float32")
+
+        loss_func = keras.losses.CategoricalCrossentropy(from_logits=True)
+
+        ## Compute losses (pay attention to the indexing) ##
+        source_loss = (
+            loss_func(source_labels, final_source_logits[:SOURCE_BATCH_SIZE])
+            + loss_func(
+                source_labels, final_source_logits[SOURCE_BATCH_SIZE:total_source]
             )
+        ) / 2
 
-            ## 2. Distribution alignment (only consider weakly augmented images) ##
-            # Compute softmax for logits of the WEAKLY augmented SOURCE images.
-            y_hat_source_w = tf.nn.softmax(final_source_logits[: tf.shape(source_w)[0]])
-
-            # Extract logits for the WEAKLY augmented TARGET images and compute softmax.
-            logits_target = combined_logits[total_source:]
-            logits_target_w = logits_target[: tf.shape(target_w)[0]]
-            y_hat_target_w = tf.nn.softmax(logits_target_w)
-
-            # Align the target label distribution to that of the source.
-            expectation_ratio = tf.reduce_mean(y_hat_source_w) / tf.reduce_mean(
-                y_hat_target_w
+        target_loss = ops.mean(
+            keras.losses.categorical_crossentropy(
+                y_tilde_target_w,
+                logits_target[TARGET_BATCH_SIZE:],
+                from_logits=True,
             )
-            y_tilde_target_w = tf.math.l2_normalize(
-                y_hat_target_w * expectation_ratio, 1
-            )
+            * mask
+        )
 
-            ## 3. Relative confidence thresholding ##
-            row_wise_max = tf.reduce_max(y_hat_source_w, axis=-1)
-            final_sum = tf.reduce_mean(row_wise_max, 0)
-            c_tau = self.tau * final_sum
-            mask = tf.reduce_max(y_tilde_target_w, axis=-1) >= c_tau
+        t = self.compute_mu()  # Compute weight for the target loss
+        total_loss = source_loss + (
+            t * target_loss
+        )  # Update current training step for the scheduler
 
-            ## Compute losses (pay attention to the indexing) ##
-            source_loss = compute_loss_source(
-                source_labels,
-                final_source_logits[: tf.shape(source_w)[0]],
-                final_source_logits[tf.shape(source_w)[0] :],
-            )
-            target_loss = compute_loss_target(
-                y_tilde_target_w, logits_target[tf.shape(target_w)[0] :], mask
-            )
+        self.current_step.assign_add(1.0)
 
-            t = self.compute_mu()  # Compute weight for the target loss
-            total_loss = source_loss + (t * target_loss)
-            self.current_step.assign_add(
-                1
-            )  # Update current training step for the scheduler
-
-        gradients = tape.gradient(total_loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-
-        self.loss_tracker.update_state(total_loss)
-        return {"loss": self.loss_tracker.result()}
+        return total_loss
 
 
 """
@@ -403,41 +355,6 @@ that the following model has a scaling layer inside it that scales the pixel val
 
 
 def wide_basic(x, n_input_plane, n_output_plane, stride):
-    conv_params = [[3, 3, stride, "same"], [3, 3, (1, 1), "same"]]
-
-    n_bottleneck_plane = n_output_plane
-
-    # Residual block
-    for i, v in enumerate(conv_params):
-        if i == 0:
-            if n_input_plane != n_output_plane:
-                x = layers.BatchNormalization()(x)
-                x = layers.Activation("relu")(x)
-                convs = x
-            else:
-                convs = layers.BatchNormalization()(x)
-                convs = layers.Activation("relu")(convs)
-            convs = layers.Conv2D(
-                n_bottleneck_plane,
-                (v[0], v[1]),
-                strides=v[2],
-                padding=v[3],
-                kernel_initializer=INIT,
-                kernel_regularizer=regularizers.l2(WEIGHT_DECAY),
-                use_bias=False,
-            )(convs)
-        else:
-            convs = layers.BatchNormalization()(convs)
-            convs = layers.Activation("relu")(convs)
-            convs = layers.Conv2D(
-                n_bottleneck_plane,
-                (v[0], v[1]),
-                strides=v[2],
-                padding=v[3],
-                kernel_initializer=INIT,
-                kernel_regularizer=regularizers.l2(WEIGHT_DECAY),
-                use_bias=False,
-            )(convs)
 
     # Shortcut connection: identity function or 1x1
     # convolutional
@@ -446,81 +363,57 @@ def wide_basic(x, n_input_plane, n_output_plane, stride):
     #   each
     #   group; see `block_series()`).
     if n_input_plane != n_output_plane:
+
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation("relu")(x)
+
         shortcut = layers.Conv2D(
-            n_output_plane,
-            (1, 1),
-            strides=stride,
-            padding="same",
-            kernel_initializer=INIT,
-            kernel_regularizer=regularizers.l2(WEIGHT_DECAY),
-            use_bias=False,
+            n_output_plane, (1, 1), strides=stride, padding="same", use_bias=False
         )(x)
+
+        convs = layers.Conv2D(
+            n_output_plane, (3, 3), strides=stride, padding="same", use_bias=False
+        )(x)
+
     else:
+
         shortcut = x
+
+        convs = layers.BatchNormalization()(x)
+        convs = layers.Activation("relu")(convs)
+
+        convs = layers.Conv2D(
+            n_output_plane, (3, 3), strides=stride, padding="same", use_bias=False
+        )(convs)
+
+    convs = layers.BatchNormalization()(convs)
+    convs = layers.Activation("relu")(convs)
+
+    convs = layers.Conv2D(
+        n_output_plane, (3, 3), strides=1, padding="same", use_bias=False
+    )(convs)
 
     return layers.Add()([convs, shortcut])
 
 
-# Stacking residual units on the same stage
-def block_series(x, n_input_plane, n_output_plane, count, stride):
-    x = wide_basic(x, n_input_plane, n_output_plane, stride)
-    for i in range(2, int(count + 1)):
-        x = wide_basic(x, n_output_plane, n_output_plane, stride=1)
-    return x
+def get_network():
+    n = (DEPTH - 4) // 6
+    stages = [16, 16 * WIDTH_MULT, 32 * WIDTH_MULT, 64 * WIDTH_MULT]
+    inputs = keras.Input(shape=(32, 32, 3))
 
+    x = layers.Rescaling(1.0 / 255)(inputs)
+    x = layers.Conv2D(stages[0], (3, 3), padding="same", use_bias=False)(x)
 
-def get_network(image_size=32, num_classes=10):
-    n = (DEPTH - 4) / 6
-    n_stages = [16, 16 * WIDTH_MULT, 32 * WIDTH_MULT, 64 * WIDTH_MULT]
+    for i in range(1, 4):
+        x = wide_basic(x, stages[i - 1], stages[i], stride=(1 if i == 1 else 2))
+        for _ in range(n - 1):
+            x = wide_basic(x, stages[i], stages[i], stride=1)
 
-    inputs = keras.Input(shape=(image_size, image_size, 3))
-    x = layers.Rescaling(scale=1.0 / 255)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.GlobalAveragePooling2D()(x)
 
-    conv1 = layers.Conv2D(
-        n_stages[0],
-        (3, 3),
-        strides=1,
-        padding="same",
-        kernel_initializer=INIT,
-        kernel_regularizer=regularizers.l2(WEIGHT_DECAY),
-        use_bias=False,
-    )(x)
-
-    ## Add wide residual blocks ##
-
-    conv2 = block_series(
-        conv1,
-        n_input_plane=n_stages[0],
-        n_output_plane=n_stages[1],
-        count=n,
-        stride=(1, 1),
-    )  # Stage 1
-
-    conv3 = block_series(
-        conv2,
-        n_input_plane=n_stages[1],
-        n_output_plane=n_stages[2],
-        count=n,
-        stride=(2, 2),
-    )  # Stage 2
-
-    conv4 = block_series(
-        conv3,
-        n_input_plane=n_stages[2],
-        n_output_plane=n_stages[3],
-        count=n,
-        stride=(2, 2),
-    )  # Stage 3
-
-    batch_norm = layers.BatchNormalization()(conv4)
-    relu = layers.Activation("relu")(batch_norm)
-
-    # Classifier
-    trunk_outputs = layers.GlobalAveragePooling2D()(relu)
-    outputs = layers.Dense(
-        num_classes, kernel_regularizer=regularizers.l2(WEIGHT_DECAY)
-    )(trunk_outputs)
-
+    outputs = layers.Dense(10)(x)
     return keras.Model(inputs, outputs)
 
 
@@ -531,6 +424,7 @@ as possible.
 """
 
 wrn_model = get_network()
+
 print(f"Model has {wrn_model.count_params()/1e6} Million parameters.")
 
 """
@@ -539,29 +433,39 @@ print(f"Model has {wrn_model.count_params()/1e6} Million parameters.")
 
 reduce_lr = keras.optimizers.schedules.CosineDecay(LEARNING_RATE, TOTAL_STEPS, 0.25)
 optimizer = keras.optimizers.Adam(reduce_lr)
-
 adamatch_trainer = AdaMatch(model=wrn_model, total_steps=TOTAL_STEPS)
+
 adamatch_trainer.compile(optimizer=optimizer)
+sample_batch = train_ds[0][0]
+_ = adamatch_trainer(sample_batch)
 
 """
 ## Model training
 """
 
-total_ds = tf.data.Dataset.zip((final_source_ds, final_target_ds))
-adamatch_trainer.fit(total_ds, epochs=EPOCHS)
+adamatch_trainer.fit(train_ds, epochs=EPOCHS)
 
 """
 ## Evaluation on the target and source test sets
 """
 
-# Compile the AdaMatch model to yield accuracy.
 adamatch_trained_model = adamatch_trainer.model
 adamatch_trained_model.compile(metrics=keras.metrics.SparseCategoricalAccuracy())
 
-# Score on the target test set.
-svhn_test = svhn_test.batch(TARGET_BATCH_SIZE).prefetch(AUTO)
-_, accuracy = adamatch_trained_model.evaluate(svhn_test)
-print(f"Accuracy on target test set: {accuracy * 100:.2f}%")
+test_path = keras.utils.get_file(
+    "test_32x32.mat",
+    "http://ufldl.stanford.edu/housenumbers/test_32x32.mat",
+)
+
+svhn_test = scipy.io.loadmat(test_path)
+
+x_test = np.transpose(svhn_test["X"], (3, 0, 1, 2)).astype("float32")
+y_test = svhn_test["y"].flatten()
+y_test[y_test == 10] = 0
+results = adamatch_trained_model.evaluate(x_test, y_test, verbose=0)
+accuracy = results[1]
+
+print(f"SVHN Accuracy: {accuracy *100:.2f}%")
 
 """
 With more training, this score improves. When this same network is trained with
@@ -573,23 +477,25 @@ to learn more about the hyperparameters and other experimental details.
 
 
 # Utility function for preprocessing the source test set.
-def prepare_test_ds_source(image, label):
-    image = tf.image.resize_with_pad(image, RESIZE_TO, RESIZE_TO)
-    image = tf.tile(image, [1, 1, 3])
-    return image, label
+def prepare_test_ds_source(images):
+    resizer = layers.Resizing(RESIZE_TO, RESIZE_TO)
+    images = images.astype("float32")
+    images = resizer(images)
+    images = ops.tile(images, (1, 1, 1, 3))
+    return images
 
 
-source_test_ds = tf.data.Dataset.from_tensor_slices((mnist_x_test, mnist_y_test))
-source_test_ds = (
-    source_test_ds.map(prepare_test_ds_source, num_parallel_calls=AUTO)
-    .batch(TARGET_BATCH_SIZE)
-    .prefetch(AUTO)
+x_source_test = prepare_test_ds_source(mnist_x_test)
+results = adamatch_trained_model.evaluate(
+    x_source_test,
+    mnist_y_test,
+    batch_size=TARGET_BATCH_SIZE,
+    verbose=0,
 )
 
-# Evaluation on the source test set.
-_, accuracy = adamatch_trained_model.evaluate(source_test_ds)
-print(f"Accuracy on source test set: {accuracy * 100:.2f}%")
+accuracy = results[1]
 
+print(f"Accuracy on source test set: {accuracy * 100:.2f}%")
 """
 You can reproduce the results by using these
 [model weights](https://github.com/sayakpaul/AdaMatch-TF/releases/tag/v1.0.0).
