@@ -2,7 +2,7 @@
 Title: Semi-supervision and domain adaptation with AdaMatch
 Author: [Sayak Paul](https://twitter.com/RisingSayak)
 Date created: 2021/06/19
-Last modified: 2026/03/09
+Last modified: 2026/03/10
 Description: Unifying semi-supervised learning and unsupervised domain adaptation with AdaMatch.
 Accelerator: GPU
 Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
@@ -70,6 +70,7 @@ keras.utils.set_random_seed(42)
 import numpy as np
 from keras import layers, ops
 import scipy.io
+from PIL import Image
 
 """
 ## Prepare the data
@@ -126,21 +127,59 @@ WIDTH_MULT = 2
 
 
 class AdaMatchDataset(keras.utils.PyDataset):
-    def __init__(self, source_x, source_y, target_x, **kwargs):
+    def __init__(self, source_x, source_y, target_x, target_size=32, **kwargs):
+        """
+        Dataset for AdaMatch training.
+        Performs resize-and-pad on source images to preserve aspect ratio,
+        then tiles them to 3 channels if needed.
+        """
         super().__init__(**kwargs)
         self.source_x = source_x
         self.source_y = source_y
         self.target_x = target_x
-        self.resizer = layers.Resizing(RESIZE_TO, RESIZE_TO)
+        self.target_size = target_size
 
     def __len__(self):
         return STEPS_PER_EPOCH
 
+    def resize_and_pad(self, images):
+        """
+        Resize images to target_size x target_size while preserving aspect ratio.
+        Pads with zeros if necessary.
+        """
+        resized_images = []
+        for img in images:
+            img = np.squeeze(img)
+            if img.ndim == 2:
+                img = np.expand_dims(img, -1)  # grayscale to (H,W,1)
+            h, w = img.shape[:2]
+            scale = self.target_size / max(h, w)
+            new_h = int(h * scale)
+            new_w = int(w * scale)
+            if img.shape[2] == 1:
+                pil_img = Image.fromarray(img[:, :, 0])
+            else:
+                pil_img = Image.fromarray(img.astype(np.uint8))
+            pil_resized = pil_img.resize((new_w, new_h), Image.BILINEAR)
+            resized = (
+                np.expand_dims(np.array(pil_resized), -1)
+                if img.shape[2] == 1
+                else np.array(pil_resized)
+            )
+            # Pad
+            pad_h = (self.target_size - new_h) // 2
+            pad_w = (self.target_size - new_w) // 2
+            padded = np.zeros(
+                (self.target_size, self.target_size, img.shape[2]), dtype=img.dtype
+            )
+            padded[pad_h : pad_h + new_h, pad_w : pad_w + new_w, :] = resized
+            resized_images.append(padded)
+        return np.array(resized_images, dtype="float32")
+
     def __getitem__(self, idx):
         s_idx = np.random.choice(len(self.source_x), SOURCE_BATCH_SIZE)
         t_idx = np.random.choice(len(self.target_x), TARGET_BATCH_SIZE)
-
-        s_imgs = self.resizer(self.source_x[s_idx].astype("float32"))
+        s_imgs = self.resize_and_pad(self.source_x[s_idx])
         s_imgs = ops.tile(s_imgs, (1, 1, 1, 3))
 
         t_imgs = self.target_x[t_idx].astype("float32")
@@ -279,12 +318,11 @@ class AdaMatch(keras.Model):
         loss_func = keras.losses.CategoricalCrossentropy(from_logits=True)
 
         ## Compute losses (pay attention to the indexing) ##
-        source_loss = (
-            loss_func(source_labels, final_source_logits[:SOURCE_BATCH_SIZE])
-            + loss_func(
-                source_labels, final_source_logits[SOURCE_BATCH_SIZE:total_source]
-            )
-        ) / 2
+        source_loss = loss_func(
+            source_labels, final_source_logits[:SOURCE_BATCH_SIZE]
+        ) + loss_func(
+            source_labels, final_source_logits[SOURCE_BATCH_SIZE:total_source]
+        )
 
         target_loss = ops.mean(
             keras.losses.categorical_crossentropy(
@@ -368,7 +406,13 @@ def wide_basic(x, n_input_plane, n_output_plane, stride):
         x = layers.Activation("relu")(x)
 
         shortcut = layers.Conv2D(
-            n_output_plane, (1, 1), strides=stride, padding="same", use_bias=False
+            n_output_plane,
+            (1, 1),
+            strides=stride,
+            padding="same",
+            use_bias=False,
+            kernel_initializer=INIT,
+            kernel_regularizer=keras.regularizers.l2(WEIGHT_DECAY),
         )(x)
 
         convs = layers.Conv2D(
