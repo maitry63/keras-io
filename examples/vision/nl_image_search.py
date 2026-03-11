@@ -1,8 +1,7 @@
-"""
-Title: Natural language image search with a Dual Encoder
-Author: Khalid Salama
+"""Title: Natural language image search with a Dual Encoder
+Author: [Khalid Salama](https://www.linkedin.com/in/khalid-salama-24403144/)
 Date created: 2021/01/30
-Last modified: 2026/02/16
+Last modified: 2026/03/11
 Description: Implementation of a dual encoder model for retrieving images that match natural language queries.
 Accelerator: GPU
 Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
@@ -13,11 +12,14 @@ Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
 
 The example demonstrates how to build a dual encoder (also known as two-tower) neural network
 model to search for images using natural language. The model is inspired by
-the [CLIP](https://openai.com/blog/clip/)
-approach, introduced by Alec Radford et al. The idea is to train a vision encoder and a text
-encoder jointly to project the representation of images and their captions into the same embedding
-space, such that the caption embeddings are located near the embeddings of the images they describe.
+the [CLIP](https://openai.com/blog/clip/) approach introduced by Alec Radford et al.
+
+The idea is to train a vision encoder and a text encoder jointly to project the
+representation of images and their captions into the same embedding space, such that
+caption embeddings are located near the embeddings of the images they describe.
+
 """
+
 """
 ## Setup
 """
@@ -31,7 +33,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 from tqdm import tqdm
-import keras_nlp
+import keras_hub
 import keras
 from keras import layers, ops
 from keras.utils import PyDataset, load_img, img_to_array
@@ -133,7 +135,7 @@ train_image_paths = image_paths[:train_size]
 valid_image_paths = image_paths[train_size : train_size + valid_size]
 
 
-bert_preprocessor = keras_nlp.models.BertPreprocessor.from_preset(
+bert_preprocessor = keras_hub.models.BertPreprocessor.from_preset(
     "bert_small_en_uncased"
 )
 
@@ -233,14 +235,14 @@ def create_vision_encoder(num_layers, dim, dropout, trainable=False):
 """
 ## Implement the text encoder
 We use [BERT](bert_small_en_uncased)
-from [KerasNLP](https://keras.io/api/keras_nlp/models/bert_backbone/) as the text encoder
+from [KerasHUB](https://keras.io/keras_hub/api/models/bert/bert_backbone/) as the text encoder
 """
 
 
 def create_text_encoder(num_layers, dim, dropout, trainable=False):
 
     # Load the pre-trained BERT model to be used as the base encoder.
-    bert = keras_nlp.models.BertBackbone.from_preset("bert_small_en_uncased")
+    bert = keras_hub.models.BertBackbone.from_preset("bert_small_en_uncased")
 
     # Set the trainability of the base encoder.
     bert.trainable = trainable
@@ -349,7 +351,7 @@ In this experiment, we freeze the base encoders for text and images, and make on
 the projection head trainable.
 """
 
-num_epochs = 2  # In practice, train for at least 30 epochs
+num_epochs = 5  # In practice, train for at least 30 epochs
 batch_size = 256
 vision_encoder = create_vision_encoder(1, 256, 0.1)
 text_encoder = create_text_encoder(1, 256, 0.1)
@@ -487,11 +489,11 @@ def find_matches(image_embeddings, queries, k=9):
     # Retrieve top k indices.
     results = np.argsort(dot_similarity, axis=-1)[:, ::-1][:, :k]
     # Return matching image paths.
-    return [[image_paths[i] for i in row] for row in results]
+    return [[image_paths[idx] for idx in indices] for indices in results]
 
 
 """
-## Set the `query` variable to the type of images you want to search for.
+Set the `query` variable to the type of images you want to search for.
 Try things like: 'a plate of healthy food',
 'a woman wearing a hat is walking down a sidewalk',
 'a bird sits near to the water', or 'wild animals are standing in a field'.
