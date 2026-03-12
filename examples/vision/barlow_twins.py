@@ -2,9 +2,10 @@
 Title: Barlow Twins for Contrastive SSL
 Author: [Abhiraam Eranti](https://github.com/dewball345)
 Date created: 11/4/21
-Last modified: 12/20/21
+Last modified: 03/06/26
 Description: A keras implementation of Barlow Twins (constrastive SSL with redundancy reduction).
 Accelerator: GPU
+Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
 """
 
 """
@@ -135,10 +136,6 @@ Original Implementation:
 ## Setup
 """
 
-"""shell
-pip install tensorflow-addons
-"""
-
 import os
 
 # slightly faster improvements, on the first epoch 30 second decrease and a 1-2 second
@@ -146,17 +143,17 @@ import os
 
 # Allocates two threads for a gpu private which allows more operations to be
 # done faster
-os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
+os.environ["KERAS_BACKEND"] = "tensorflow"
 
-import tensorflow as tf  # framework
-from tensorflow import keras  # for tf.keras
-import tensorflow_addons as tfa  # LAMB optimizer and gaussian_blur_2d function
+import keras
 import numpy as np  # np.random.random
 import matplotlib.pyplot as plt  # graphs
-import datetime  # tensorboard logs naming
+from keras import layers, random, losses, ops
+from keras.utils import Sequence
+from scipy.ndimage import gaussian_filter
 
 # XLA optimization for faster performance(up to 10-15 minutes total time saved)
-tf.config.optimizer.set_jit(True)
+# tf.config.optimizer.set_jit(True)
 
 """
 ## Load the CIFAR-10 dataset
@@ -174,9 +171,9 @@ test_features = test_features / 255.0
 ## Necessary Hyperparameters
 """
 
-# Batch size of dataset
+# Batch size
 BATCH_SIZE = 512
-# Width and height of image
+
 IMAGE_SIZE = 32
 
 """
@@ -211,7 +208,6 @@ class Augmentation(keras.layers.Layer):
     def __init__(self):
         super().__init__()
 
-    @tf.function
     def random_execute(self, prob: float) -> bool:
         """random_execute function.
 
@@ -223,10 +219,10 @@ class Augmentation(keras.layers.Layer):
             returns true or false based on the probability.
         """
 
-        return tf.random.uniform([], minval=0, maxval=1) < prob
+        return random.uniform([], minval=0, maxval=1) < prob
 
 
-class RandomToGrayscale(Augmentation):
+class RandomToGrayscale:
     """RandomToGrayscale class.
 
     RandomToGrayscale class. Randomly makes an image
@@ -238,21 +234,14 @@ class RandomToGrayscale(Augmentation):
           the time.
     """
 
-    @tf.function
-    def call(self, x: tf.Tensor) -> tf.Tensor:
-        """call function.
+    def __init__(self, prob=0.2):
+        self.prob = prob
 
-        Arguments:
-            x: a tf.Tensor representing the image.
-
-        Returns:
-            returns a grayscaled version of the image 20% of the time
-              and the original image 80% of the time.
-        """
-
-        if self.random_execute(0.2):
-            x = tf.image.rgb_to_grayscale(x)
-            x = tf.tile(x, [1, 1, 3])
+    def __call__(self, x):
+        if np.random.rand() < self.prob:
+            # average channels to get grayscale
+            gray = np.mean(x, axis=-1, keepdims=True)
+            x = np.repeat(gray, 3, axis=-1)
         return x
 
 
@@ -269,36 +258,20 @@ class RandomColorJitter(Augmentation):
           the time.
     """
 
-    @tf.function
-    def call(self, x: tf.Tensor) -> tf.Tensor:
-        """call function.
+    def __init__(self, prob=0.8):
+        self.prob = prob
 
-        Adds color jitter to image, including:
-          Brightness change by a max-delta of 0.8
-          Contrast change by a max-delta of 0.8
-          Saturation change by a max-delta of 0.8
-          Hue change by a max-delta of 0.2
-        Originally, the same deltas of the original paper
-        were used, but a performance boost of almost 2% was found
-        when doubling them.
-
-        Arguments:
-            x: a tf.Tensor representing the image.
-
-        Returns:
-            returns a color-jittered version of the image 80% of the time
-              and the original image 20% of the time.
-        """
-
-        if self.random_execute(0.8):
-            x = tf.image.random_brightness(x, 0.8)
-            x = tf.image.random_contrast(x, 0.4, 1.6)
-            x = tf.image.random_saturation(x, 0.4, 1.6)
-            x = tf.image.random_hue(x, 0.2)
+    def __call__(self, x):
+        if np.random.rand() < self.prob:
+            x = x + np.random.uniform(-0.2, 0.2)
+            x = (x - 0.5) * np.random.uniform(0.8, 1.2) + 0.5
+            gray = np.mean(x, axis=-1, keepdims=True)
+            x = gray + (x - gray) * np.random.uniform(0.8, 1.2)
+            x = np.clip(x, 0, 1)
         return x
 
 
-class RandomFlip(Augmentation):
+class RandomFlip:
     """RandomFlip class.
 
     RandomFlip class. Randomly flips image horizontally. There is a 50%
@@ -309,65 +282,41 @@ class RandomFlip(Augmentation):
           the time.
     """
 
-    @tf.function
-    def call(self, x: tf.Tensor) -> tf.Tensor:
+    def __init__(self, prob=0.5):
+        self.prob = prob
+
+    def __call__(self, x):
         """call function.
 
         Randomly flips the image.
 
         Arguments:
-            x: a tf.Tensor representing the image.
+            x: a Tensor representing the image.
 
         Returns:
             returns a flipped version of the image 50% of the time
               and the original image 50% of the time.
         """
 
-        if self.random_execute(0.5):
-            x = tf.image.random_flip_left_right(x)
+        if np.random.rand() < self.prob:
+            # flip horizontally
+            x = np.fliplr(x)
         return x
 
 
 class RandomResizedCrop(Augmentation):
-    """RandomResizedCrop class.
-
-    RandomResizedCrop class. Randomly crop an image to a random size,
-    then resize the image back to the original size.
-
-    Attributes:
-        image_size: The dimension of the image
-
-    Methods:
-        __call__: method that does random resize crop to the image.
-    """
-
     def __init__(self, image_size):
-        super().__init__()
         self.image_size = image_size
+        self.resize_layer = layers.Resizing(image_size, image_size)
 
-    def call(self, x: tf.Tensor) -> tf.Tensor:
-        """call function.
-
-        Does random resize crop by randomly cropping an image to a random
-        size 75% - 100% the size of the image. Then resizes it.
-
-        Arguments:
-            x: a tf.Tensor representing the image.
-
-        Returns:
-            returns a randomly cropped image.
-        """
-
-        rand_size = tf.random.uniform(
-            shape=[],
-            minval=int(0.75 * self.image_size),
-            maxval=1 * self.image_size,
-            dtype=tf.int32,
-        )
-
-        crop = tf.image.random_crop(x, (rand_size, rand_size, 3))
-        crop_resize = tf.image.resize(crop, (self.image_size, self.image_size))
-        return crop_resize
+    def __call__(self, x):
+        h, w, _ = x.shape
+        rand_size = int(np.random.uniform(0.75 * self.image_size, self.image_size))
+        top = np.random.randint(0, max(h - rand_size + 1, 1))
+        left = np.random.randint(0, max(w - rand_size + 1, 1))
+        crop = x[top : top + rand_size, left : left + rand_size, :]
+        crop_resized = self.resize_layer(np.expand_dims(crop, 0))[0].numpy()
+        return crop_resized
 
 
 class RandomSolarize(Augmentation):
@@ -380,23 +329,24 @@ class RandomSolarize(Augmentation):
         call: method that does random solarization 20% of the time.
     """
 
-    @tf.function
-    def call(self, x: tf.Tensor) -> tf.Tensor:
+    def __init__(self, prob=0.2, threshold=0.5):
+        self.prob = prob
+        self.threshold = threshold
+
+    def __call__(self, x):
         """call function.
 
         Randomly solarizes the image.
 
         Arguments:
-            x: a tf.Tensor representing the image.
+            x: a Tensor representing the image.
 
         Returns:
             returns a solarized version of the image 20% of the time
               and the original image 80% of the time.
         """
-
-        if self.random_execute(0.2):
-            # flips abnormally low pixels to abnormally high pixels
-            x = tf.where(x < 10, x, 255 - x)
+        if np.random.rand() < self.prob:
+            x = np.where(x < self.threshold, x, 1.0 - x)
         return x
 
 
@@ -409,27 +359,28 @@ class RandomBlur(Augmentation):
         call: method that does random blur 20% of the time.
     """
 
-    @tf.function
-    def call(self, x: tf.Tensor) -> tf.Tensor:
+    def __init__(self, prob=0.2):
+        self.prob = prob
+
+    def __call__(self, x):
         """call function.
 
         Randomly solarizes the image.
 
         Arguments:
-            x: a tf.Tensor representing the image.
+            x: a Tensor representing the image.
 
         Returns:
             returns a blurred version of the image 20% of the time
               and the original image 80% of the time.
         """
-
-        if self.random_execute(0.2):
-            s = np.random.random()
-            return tfa.image.gaussian_filter2d(image=x, sigma=s)
+        if np.random.rand() < self.prob:
+            sigma = np.random.rand() * 1.0
+            x = gaussian_filter(x, sigma=(sigma, sigma, 0))
         return x
 
 
-class RandomAugmentor(keras.Model):
+class RandomAugmentor:
     """RandomAugmentor class.
 
     RandomAugmentor class. Chains all the augmentations into
@@ -455,10 +406,7 @@ class RandomAugmentor(keras.Model):
         call: chains layers in pipeline together
     """
 
-    def __init__(self, image_size: int):
-        super().__init__()
-
-        self.image_size = image_size
+    def __init__(self, image_size):
         self.random_resized_crop = RandomResizedCrop(image_size)
         self.random_flip = RandomFlip()
         self.random_color_jitter = RandomColorJitter()
@@ -466,16 +414,14 @@ class RandomAugmentor(keras.Model):
         self.random_to_grayscale = RandomToGrayscale()
         self.random_solarize = RandomSolarize()
 
-    def call(self, x: tf.Tensor) -> tf.Tensor:
+    def __call__(self, x):
         x = self.random_resized_crop(x)
         x = self.random_flip(x)
         x = self.random_color_jitter(x)
         x = self.random_blur(x)
         x = self.random_to_grayscale(x)
         x = self.random_solarize(x)
-
-        x = tf.clip_by_value(x, 0, 1)
-        return x
+        return np.clip(x, 0, 1)
 
 
 bt_augmentor = RandomAugmentor(IMAGE_SIZE)
@@ -497,7 +443,7 @@ class BTDatasetCreator:
     barlow twins' dataset.
 
     Attributes:
-        options: tf.data.Options needed to configure a setting
+        options: data.Options needed to configure a setting
           that may improve performance.
         seed: random seed for shuffling. Used to synchronize two
           augmented versions.
@@ -508,29 +454,71 @@ class BTDatasetCreator:
         augmented_version: creates 1 half of the dataset.
     """
 
-    def __init__(self, augmentor: RandomAugmentor, seed: int = 1024):
-        self.options = tf.data.Options()
-        self.options.threading.max_intra_op_parallelism = 1
-        self.seed = seed
+    """Creates Barlow Twins augmentation datasets using pure Python Sequence."""
+
+    def __init__(self, augmentor, batch_size=BATCH_SIZE, seed=1024):
         self.augmentor = augmentor
+        self.batch_size = batch_size
+        self.seed = seed
 
-    def augmented_version(self, ds: list) -> tf.data.Dataset:
-        return (
-            tf.data.Dataset.from_tensor_slices(ds)
-            .shuffle(1000, seed=self.seed)
-            .map(self.augmentor, num_parallel_calls=tf.data.AUTOTUNE)
-            .batch(BATCH_SIZE, drop_remainder=True)
-            .prefetch(tf.data.AUTOTUNE)
-            .with_options(self.options)
-        )
+    def augmented_version(self, x):
+        """Return a Sequence that yields two augmented versions of each batch."""
 
-    def __call__(self, ds: list) -> tf.data.Dataset:
-        a1 = self.augmented_version(ds)
-        a2 = self.augmented_version(ds)
+        class AugmentedSequence(Sequence):
+            def __init__(self, x, augmentor, batch_size, seed):
+                super().__init__()
+                self.x = x
+                self.augmentor = augmentor
+                self.batch_size = batch_size
+                self.seed = seed
+                self.on_epoch_end()
 
-        return tf.data.Dataset.zip((a1, a2)).with_options(self.options)
+            def __len__(self):
+                return int(np.ceil(len(self.x) / self.batch_size))
+
+            def __getitem__(self, index):
+                batch = self.x[index * self.batch_size : (index + 1) * self.batch_size]
+                a1 = np.stack([self.augmentor(xi) for xi in batch])
+                a2 = np.stack([self.augmentor(xi) for xi in batch])
+                return a1, a2
+
+            def on_epoch_end(self):
+                np.random.seed(self.seed)
+                idx = np.arange(len(self.x))
+                np.random.shuffle(idx)
+                self.x = self.x[idx]
+
+        return AugmentedSequence(x, self.augmentor, self.batch_size, self.seed)
+
+    def __call__(self, x):
+        """Return a zipped Sequence with two augmented views per batch."""
+        seq1 = self.augmented_version(x)
+        seq2 = self.augmented_version(x)
+
+        class ZippedSequence(Sequence):
+            def __init__(self, seq1, seq2):
+                super().__init__()
+                self.seq1 = seq1
+                self.seq2 = seq2
+
+            def __len__(self):
+                return min(len(self.seq1), len(self.seq2))
+
+            def __getitem__(self, index):
+                a1, _ = self.seq1[index]
+                a2, _ = self.seq2[index]
+                batch_size = len(a1)
+                sam = np.zeros((batch_size, 1))
+                return (a1, a2), sam
+
+            def on_epoch_end(self):
+                self.seq1.on_epoch_end()
+                self.seq2.on_epoch_end()
+
+        return ZippedSequence(seq1, seq2)
 
 
+bt_augmentor = RandomAugmentor(IMAGE_SIZE)
 augment_versions = BTDatasetCreator(bt_augmentor)(train_features)
 
 """
@@ -540,24 +528,18 @@ View examples of dataset.
 sample_augment_versions = iter(augment_versions)
 
 
-def plot_values(batch: tuple):
-    fig, axs = plt.subplots(3, 3)
-    fig1, axs1 = plt.subplots(3, 3)
+def plot_values(batch):
+    (a1, a2), _ = batch
 
-    fig.suptitle("Augmentation 1")
-    fig1.suptitle("Augmentation 2")
+    fig, axs = plt.subplots(3, 3, figsize=(6, 6))
 
-    a1, a2 = batch
-
-    # plots images on both tables
     for i in range(3):
         for j in range(3):
-            # CHANGE(add / 255)
-            axs[i][j].imshow(a1[3 * i + j])
+            img = a1[3 * i + j]  # shape (32, 32, 3)
+            axs[i][j].imshow(img)
             axs[i][j].axis("off")
-            axs1[i][j].imshow(a2[3 * i + j])
-            axs1[i][j].axis("off")
 
+    plt.tight_layout()
     plt.show()
 
 
@@ -606,13 +588,10 @@ representation neurons are correlated with values that are not on the diagonal.
 
 After this the two parts are summed together.
 
-
-
-
 """
 
 
-class BarlowLoss(keras.losses.Loss):
+class BarlowLoss(losses.Loss):
     """BarlowLoss class.
 
     BarlowLoss class. Creates a loss function based on the cross-correlation
@@ -631,7 +610,7 @@ class BarlowLoss(keras.losses.Loss):
           matrix.
     """
 
-    def __init__(self, batch_size: int):
+    def __init__(self, batch_size, lambd=0.0051, **kwargs):
         """__init__ method.
 
         Gets the instance variables
@@ -640,31 +619,26 @@ class BarlowLoss(keras.losses.Loss):
             batch_size: An integer value representing the batch size of the
               dataset. Used for cross correlation matrix calculation.
         """
-
-        super().__init__()
-        self.lambda_amt = 5e-3
+        super().__init__(**kwargs)
         self.batch_size = batch_size
+        self.lambd = lambd
 
-    def get_off_diag(self, c: tf.Tensor) -> tf.Tensor:
-        """get_off_diag method.
+    def normalize(self, z):
+        """normalize method.
 
-        Makes the diagonals of the cross correlation matrix zeros.
-        This is used in the off-diagonal portion of the loss function,
-        where we take the squares of the off-diagonal values and sum them.
+        Normalizes the model prediction.
 
         Arguments:
-            c: A tf.tensor that represents the cross correlation
-              matrix
+            output: the model prediction.
 
         Returns:
-            Returns a tf.tensor which represents the cross correlation
-            matrix with its diagonals as zeros.
+            Returns a normalized version of the model prediction.
         """
+        mean = ops.mean(z, axis=0, keepdims=True)
+        std = ops.std(z, axis=0, keepdims=True)
+        return (z - mean) / (std + 1e-10)
 
-        zero_diag = tf.zeros(c.shape[-1])
-        return tf.linalg.set_diag(c, zero_diag)
-
-    def cross_corr_matrix_loss(self, c: tf.Tensor) -> tf.Tensor:
+    def cross_corr_matrix_loss(self, c):
         """cross_corr_matrix_loss method.
 
         Gets the loss based on the cross correlation matrix.
@@ -684,60 +658,25 @@ class BarlowLoss(keras.losses.Loss):
         Take the sum of the first and second parts and then sum them together.
 
         Arguments:
-            c: A tf.tensor that represents the cross correlation
+            c: A tensor that represents the cross correlation
               matrix
 
         Returns:
-            Returns a tf.tensor which represents the cross correlation
+            Returns a tensor which represents the cross correlation
             matrix with its diagonals as zeros.
         """
 
-        # subtracts diagonals by one and squares them(first part)
-        c_diff = tf.pow(tf.linalg.diag_part(c) - 1, 2)
+        # Diagonal: c_ii - 1
+        diag = ops.diagonal(c)
+        diag_loss = ops.sum(ops.square(ops.subtract(diag, 1)))
 
-        # takes off diagonal, squares it, multiplies with lambda(second part)
-        off_diag = tf.pow(self.get_off_diag(c), 2) * self.lambda_amt
+        # Off-diagonal: c_ij for i != j
+        off_diag = c - ops.diag(diag)
+        off_diag_loss = ops.sum(ops.square(off_diag))
 
-        # sum first and second parts together
-        loss = tf.reduce_sum(c_diff) + tf.reduce_sum(off_diag)
+        return diag_loss + self.lambd * off_diag_loss
 
-        return loss
-
-    def normalize(self, output: tf.Tensor) -> tf.Tensor:
-        """normalize method.
-
-        Normalizes the model prediction.
-
-        Arguments:
-            output: the model prediction.
-
-        Returns:
-            Returns a normalized version of the model prediction.
-        """
-
-        return (output - tf.reduce_mean(output, axis=0)) / tf.math.reduce_std(
-            output, axis=0
-        )
-
-    def cross_corr_matrix(self, z_a_norm: tf.Tensor, z_b_norm: tf.Tensor) -> tf.Tensor:
-        """cross_corr_matrix method.
-
-        Creates a cross correlation matrix from the predictions.
-        It transposes the first prediction and multiplies this with
-        the second, creating a matrix with shape (n_dense_units, n_dense_units).
-        See build_twin() for more info. Then it divides this with the
-        batch size.
-
-        Arguments:
-            z_a_norm: A normalized version of the first prediction.
-            z_b_norm: A normalized version of the second prediction.
-
-        Returns:
-            Returns a cross correlation matrix.
-        """
-        return (tf.transpose(z_a_norm) @ z_b_norm) / self.batch_size
-
-    def call(self, z_a: tf.Tensor, z_b: tf.Tensor) -> tf.Tensor:
+    def call(self, y_true, y_pred):
         """call method.
 
         Makes the cross-correlation loss. Uses the CreateCrossCorr
@@ -749,12 +688,22 @@ class BarlowLoss(keras.losses.Loss):
             z_b: the prediction of the second set of augmented data.
 
         Returns:
-            Returns a (rank-0) tf.Tensor that represents the loss.
+            Returns a (rank-0) Tensor that represents the loss.
         """
+        # Normalize projections
+        proj_dim = ops.shape(y_pred)[1] // 2
 
-        z_a_norm, z_b_norm = self.normalize(z_a), self.normalize(z_b)
-        c = self.cross_corr_matrix(z_a_norm, z_b_norm)
+        z_a = y_pred[:, :proj_dim]
+        z_b = y_pred[:, proj_dim:]
+
+        z_a_norm = self.normalize(z_a)
+        z_b_norm = self.normalize(z_b)
+
+        c = ops.matmul(ops.transpose(z_a_norm), z_b_norm)
+        c /= ops.cast(ops.shape(z_a_norm)[0], c.dtype)
+
         loss = self.cross_corr_matrix_loss(c)
+
         return loss
 
 
@@ -783,53 +732,45 @@ class ResNet34:
     """
 
     def identity_block(self, x, filter):
-        # copy tensor to variable called x_skip
         x_skip = x
         # Layer 1
-        x = tf.keras.layers.Conv2D(filter, (3, 3), padding="same")(x)
-        x = tf.keras.layers.BatchNormalization(axis=3)(x)
-        x = tf.keras.layers.Activation("relu")(x)
+        x = keras.layers.Conv2D(filter, (3, 3), padding="same")(x)
+        x = keras.layers.BatchNormalization(axis=3)(x)
+        x = keras.layers.Activation("relu")(x)
         # Layer 2
-        x = tf.keras.layers.Conv2D(filter, (3, 3), padding="same")(x)
-        x = tf.keras.layers.BatchNormalization(axis=3)(x)
-        # Add Residue
-        x = tf.keras.layers.Add()([x, x_skip])
-        x = tf.keras.layers.Activation("relu")(x)
+        x = keras.layers.Conv2D(filter, (3, 3), padding="same")(x)
+        x = keras.layers.BatchNormalization(axis=3)(x)
+        x = keras.layers.Add()([x, x_skip])
+        x = keras.layers.Activation("relu")(x)
         return x
 
     def convolutional_block(self, x, filter):
-        # copy tensor to variable called x_skip
         x_skip = x
         # Layer 1
-        x = tf.keras.layers.Conv2D(filter, (3, 3), padding="same", strides=(2, 2))(x)
-        x = tf.keras.layers.BatchNormalization(axis=3)(x)
-        x = tf.keras.layers.Activation("relu")(x)
+        x = keras.layers.Conv2D(filter, (3, 3), padding="same", strides=(2, 2))(x)
+        x = keras.layers.BatchNormalization(axis=3)(x)
+        x = keras.layers.Activation("relu")(x)
         # Layer 2
-        x = tf.keras.layers.Conv2D(filter, (3, 3), padding="same")(x)
-        x = tf.keras.layers.BatchNormalization(axis=3)(x)
+        x = keras.layers.Conv2D(filter, (3, 3), padding="same")(x)
+        x = keras.layers.BatchNormalization(axis=3)(x)
         # Processing Residue with conv(1,1)
-        x_skip = tf.keras.layers.Conv2D(filter, (1, 1), strides=(2, 2))(x_skip)
+        x_skip = keras.layers.Conv2D(filter, (1, 1), strides=(2, 2))(x_skip)
         # Add Residue
-        x = tf.keras.layers.Add()([x, x_skip])
-        x = tf.keras.layers.Activation("relu")(x)
+        x = keras.layers.Add()([x, x_skip])
+        x = keras.layers.Activation("relu")(x)
         return x
 
     def __call__(self, shape=(32, 32, 3)):
-        # Step 1 (Setup Input Layer)
-        x_input = tf.keras.layers.Input(shape)
-        x = tf.keras.layers.ZeroPadding2D((3, 3))(x_input)
-        # Step 2 (Initial Conv layer along with maxPool)
-        x = tf.keras.layers.Conv2D(64, kernel_size=7, strides=2, padding="same")(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation("relu")(x)
-        x = tf.keras.layers.MaxPool2D(pool_size=3, strides=2, padding="same")(x)
-        # Define size of sub-blocks and initial filter size
+        x_input = keras.layers.Input(shape)
+        x = keras.layers.ZeroPadding2D((3, 3))(x_input)
+        x = keras.layers.Conv2D(64, kernel_size=7, strides=2, padding="same")(x)
+        x = keras.layers.BatchNormalization()(x)
+        x = keras.layers.Activation("relu")(x)
+        x = keras.layers.MaxPool2D(pool_size=3, strides=2, padding="same")(x)
         block_layers = [3, 4, 6, 3]
         filter_size = 64
-        # Step 3 Add the Resnet Blocks
         for i in range(4):
             if i == 0:
-                # For sub-block 1 Residual/Convolutional block not needed
                 for j in range(block_layers[i]):
                     x = self.identity_block(x, filter_size)
             else:
@@ -839,10 +780,9 @@ class ResNet34:
                 x = self.convolutional_block(x, filter_size)
                 for j in range(block_layers[i] - 1):
                     x = self.identity_block(x, filter_size)
-        # Step 4 End Dense Network
-        x = tf.keras.layers.AveragePooling2D((2, 2), padding="same")(x)
-        x = tf.keras.layers.Flatten()(x)
-        model = tf.keras.models.Model(inputs=x_input, outputs=x, name="ResNet34")
+        x = keras.layers.AveragePooling2D((2, 2), padding="same")(x)
+        x = keras.layers.Flatten()(x)
+        model = keras.models.Model(inputs=x_input, outputs=x, name="ResNet34")
         return model
 
 
@@ -871,15 +811,15 @@ def build_twin() -> keras.Model:
     # intermediate layers of the projector network
     n_layers = 2
     for i in range(n_layers):
-        dense = tf.keras.layers.Dense(n_dense_neurons, name=f"projector_dense_{i}")
+        dense = keras.layers.Dense(n_dense_neurons, name=f"projector_dense_{i}")
         if i == 0:
             x = dense(last_layer)
         else:
             x = dense(x)
-        x = tf.keras.layers.BatchNormalization(name=f"projector_bn_{i}")(x)
-        x = tf.keras.layers.ReLU(name=f"projector_relu_{i}")(x)
+        x = keras.layers.BatchNormalization(name=f"projector_bn_{i}")(x)
+        x = keras.layers.ReLU(name=f"projector_relu_{i}")(x)
 
-    x = tf.keras.layers.Dense(n_dense_neurons, name=f"projector_dense_{n_layers}")(x)
+    x = keras.layers.Dense(n_dense_neurons, name=f"projector_dense_{n_layers}")(x)
 
     model = keras.Model(resnet.input, x)
     return model
@@ -892,58 +832,26 @@ See pseudocode for reference.
 """
 
 
-class BarlowModel(keras.Model):
-    """BarlowModel class.
+def build_barlow_model(image_shape=(32, 32, 3)):
+    """
+    Builds the full Barlow Twins training model.
 
-    BarlowModel class. Responsible for making predictions and handling
-    gradient descent with the optimizer.
-
-    Attributes:
-        model: the barlow model architecture.
-        loss_tracker: the loss metric.
-
-    Methods:
-        train_step: one train step; do model predictions, loss, and
-            optimizer step.
-        metrics: Returns metrics.
+    The model takes two augmented images as input,
+    passes both through the same encoder + projector,
+    then concatenates their projections.
     """
 
-    def __init__(self):
-        super().__init__()
-        self.model = build_twin()
-        self.loss_tracker = keras.metrics.Mean(name="loss")
+    encoder = build_twin()
 
-    @property
-    def metrics(self):
-        return [self.loss_tracker]
+    input1 = keras.Input(shape=image_shape)
+    input2 = keras.Input(shape=image_shape)
 
-    def train_step(self, batch: tf.Tensor) -> tf.Tensor:
-        """train_step method.
+    z1 = encoder(input1)
+    z2 = encoder(input2)
 
-        Do one train step. Make model predictions, find loss, pass loss to
-        optimizer, and make optimizer apply gradients.
+    z = layers.Concatenate(axis=1)([z1, z2])
 
-        Arguments:
-            batch: one batch of data to be given to the loss function.
-
-        Returns:
-            Returns a dictionary with the loss metric.
-        """
-
-        # get the two augmentations from the batch
-        y_a, y_b = batch
-
-        with tf.GradientTape() as tape:
-            # get two versions of predictions
-            z_a, z_b = self.model(y_a, training=True), self.model(y_b, training=True)
-            loss = self.loss(z_a, z_b)
-
-        grads_model = tape.gradient(loss, self.model.trainable_variables)
-
-        self.optimizer.apply_gradients(zip(grads_model, self.model.trainable_variables))
-        self.loss_tracker.update_state(loss)
-
-        return {"loss": self.loss_tracker.result()}
+    return keras.Model([input1, input2], z)
 
 
 """
@@ -956,20 +864,90 @@ faster than other methods.
 """
 
 # sets up model, optimizer, loss
+barlow_model = build_barlow_model()
 
-bm = BarlowModel()
-# chose the LAMB optimizer due to high batch sizes. Converged MUCH faster
-# than ADAM or SGD
-optimizer = tfa.optimizers.LAMB()
-loss = BarlowLoss(BATCH_SIZE)
+barlow_model.compile(
+    optimizer=keras.optimizers.Lamb(),
+    loss=BarlowLoss(BATCH_SIZE),
+)
 
-bm.compile(optimizer=optimizer, loss=loss)
-
-# Expected training time: 1 hours 30 min
-
-history = bm.fit(augment_versions, epochs=160)
+history = barlow_model.fit(augment_versions, epochs=160)
 plt.plot(history.history["loss"])
 plt.show()
+
+
+"""
+## Evaluation
+
+**Linear evaluation:** to evaluate the model's performance, we add
+a linear dense layer at the end and freeze the main model's weights, only letting the
+dense layer to be tuned. If the model actually learned something, then the accuracy would
+be significantly higher than random chance.
+
+**Accuracy on CIFAR-10** : 64% for this notebook. This is much better than the 10% we get
+from random guessing.
+"""
+
+
+"""
+## PyDataset for Linear Evaluation
+"""
+
+
+class XYDataset(Sequence):
+    def __init__(self, x, y, batch_size):
+        super().__init__()
+        self.x = x
+        self.y = y
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return int(np.ceil(len(self.x) / self.batch_size))
+
+    def __getitem__(self, index):
+        x_batch = self.x[index * self.batch_size : (index + 1) * self.batch_size]
+        y_batch = self.y[index * self.batch_size : (index + 1) * self.batch_size]
+        return x_batch, y_batch
+
+    def on_epoch_end(self):
+        idx = np.arange(len(self.x))
+        np.random.shuffle(idx)
+        self.x = self.x[idx]
+        self.y = self.y[idx]
+
+
+xy_ds = XYDataset(train_features, train_labels, BATCH_SIZE)
+test_ds = XYDataset(test_features, test_labels, BATCH_SIZE)
+
+
+"""
+## LINEAR EVALUATION MODEL
+"""
+
+model = keras.models.Sequential(
+    [
+        barlow_model.layers[2],
+        keras.layers.Dense(
+            10,
+            activation="softmax",
+            kernel_regularizer=keras.regularizers.l2(0.02),
+        ),
+    ]
+)
+
+model.layers[0].trainable = False
+
+# chose the Lamb optimizer due to high batch sizes. Converged MUCH faster
+# than ADAM or SGD
+linear_optimizer = keras.optimizers.Lamb()
+
+model.compile(
+    optimizer=linear_optimizer,
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
+)
+
+model.fit(xy_ds, epochs=35, validation_data=test_ds)
 
 """
 ## Evaluation
@@ -985,23 +963,9 @@ from random guessing.
 
 # Approx: 64% accuracy with this barlow twins model.
 
-xy_ds = (
-    tf.data.Dataset.from_tensor_slices((train_features, train_labels))
-    .shuffle(1000)
-    .batch(BATCH_SIZE, drop_remainder=True)
-    .prefetch(tf.data.AUTOTUNE)
-)
-
-test_ds = (
-    tf.data.Dataset.from_tensor_slices((test_features, test_labels))
-    .shuffle(1000)
-    .batch(BATCH_SIZE, drop_remainder=True)
-    .prefetch(tf.data.AUTOTUNE)
-)
-
 model = keras.models.Sequential(
     [
-        bm.model,
+        barlow_model.layers[2],
         keras.layers.Dense(
             10, activation="softmax", kernel_regularizer=keras.regularizers.l2(0.02)
         ),
@@ -1010,7 +974,7 @@ model = keras.models.Sequential(
 
 model.layers[0].trainable = False
 
-linear_optimizer = tfa.optimizers.LAMB()
+linear_optimizer = keras.optimizers.Lamb()
 model.compile(
     optimizer=linear_optimizer,
     loss="sparse_categorical_crossentropy",
@@ -1044,7 +1008,5 @@ with the labeled data.
 comparisons of accuracy, loss.
 * [resnet34 implementation](https://www.analyticsvidhya.com/blog/2021/08/how-to-code-your-resnet-from-scratch-in-tensorflow/#h2_2)
   * Thanks to Yashowardhan Shinde for writing the article.
-
-
 
 """
