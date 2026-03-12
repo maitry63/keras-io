@@ -2,7 +2,7 @@
 Title: Semi-supervision and domain adaptation with AdaMatch
 Author: [Sayak Paul](https://twitter.com/RisingSayak)
 Date created: 2021/06/19
-Last modified: 2026/03/10
+Last modified: 2026/03/11
 Description: Unifying semi-supervised learning and unsupervised domain adaptation with AdaMatch.
 Accelerator: GPU
 Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
@@ -18,9 +18,6 @@ June 2021). AdaMatch is particularly interesting because it
 unifies semi-supervised learning (SSL) and unsupervised domain adaptation
 (UDA) under one framework. It thereby provides a way to perform semi-supervised domain
 adaptation (SSDA).
-
-This example requires TensorFlow 2.5 or higher, as well as TensorFlow Models, which can
-be installed using the following command:
 """
 
 """
@@ -110,7 +107,7 @@ RESIZE_TO = 32
 
 SOURCE_BATCH_SIZE = 64
 TARGET_BATCH_SIZE = 3 * SOURCE_BATCH_SIZE  # Reference: Section 3.2
-EPOCHS = 5
+EPOCHS = 2
 STEPS_PER_EPOCH = len(mnist_x_train) // SOURCE_BATCH_SIZE
 TOTAL_STEPS = EPOCHS * STEPS_PER_EPOCH
 
@@ -124,7 +121,6 @@ WIDTH_MULT = 2
 """
 ## Data loading utilities
 """
-
 
 class AdaMatchDataset(keras.utils.PyDataset):
     def __init__(self, source_x, source_y, target_x, target_size=32, **kwargs):
@@ -235,6 +231,7 @@ class AdaMatch(keras.Model):
         self.tau = tau
         self.total_steps = total_steps
         self.current_step = keras.Variable(0.0, dtype="float32")
+        self.loss_tracker = keras.metrics.Mean(name="loss")
 
         self.weak_augment = keras.Sequential(
             [
@@ -245,6 +242,10 @@ class AdaMatch(keras.Model):
 
         rand_aug = layers.RandAugment(value_range=(0, 255), num_ops=2, factor=0.5)
         self.strong_aug = rand_aug
+    
+    @property
+    def metrics(self):
+        return [self.loss_tracker]
 
     # This is a warmup schedule to update the weight of the
     # loss contributed by the target unlabeled samples. More
@@ -340,6 +341,7 @@ class AdaMatch(keras.Model):
 
         self.current_step.assign_add(1.0)
 
+        self.loss_tracker.update_state(total_loss)
         return total_loss
 
 
@@ -457,7 +459,7 @@ def get_network():
     x = layers.Activation("relu")(x)
     x = layers.GlobalAveragePooling2D()(x)
 
-    outputs = layers.Dense(10)(x)
+    outputs = layers.Dense(10, kernel_regularizer=keras.regularizers.l2(WEIGHT_DECAY))(x)
     return keras.Model(inputs, outputs)
 
 
@@ -494,7 +496,7 @@ adamatch_trainer.fit(train_ds, epochs=EPOCHS)
 """
 
 adamatch_trained_model = adamatch_trainer.model
-adamatch_trained_model.compile(metrics=keras.metrics.SparseCategoricalAccuracy())
+adamatch_trained_model.compile(metrics=[keras.metrics.SparseCategoricalAccuracy()])
 
 test_path = keras.utils.get_file(
     "test_32x32.mat",
