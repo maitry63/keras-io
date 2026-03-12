@@ -2,7 +2,7 @@
 Title: Semi-supervision and domain adaptation with AdaMatch
 Author: [Sayak Paul](https://twitter.com/RisingSayak)
 Date created: 2021/06/19
-Last modified: 2026/03/11
+Last modified: 2026/03/12
 Description: Unifying semi-supervised learning and unsupervised domain adaptation with AdaMatch.
 Accelerator: GPU
 Converted to Keras 3 by: [Maitry Sinha](https://github.com/maitry63)
@@ -121,6 +121,7 @@ WIDTH_MULT = 2
 """
 ## Data loading utilities
 """
+
 
 class AdaMatchDataset(keras.utils.PyDataset):
     def __init__(self, source_x, source_y, target_x, target_size=32, **kwargs):
@@ -242,7 +243,7 @@ class AdaMatch(keras.Model):
 
         rand_aug = layers.RandAugment(value_range=(0, 255), num_ops=2, factor=0.5)
         self.strong_aug = rand_aug
-    
+
     @property
     def metrics(self):
         return [self.loss_tracker]
@@ -459,7 +460,9 @@ def get_network():
     x = layers.Activation("relu")(x)
     x = layers.GlobalAveragePooling2D()(x)
 
-    outputs = layers.Dense(10, kernel_regularizer=keras.regularizers.l2(WEIGHT_DECAY))(x)
+    outputs = layers.Dense(10, kernel_regularizer=keras.regularizers.l2(WEIGHT_DECAY))(
+        x
+    )
     return keras.Model(inputs, outputs)
 
 
